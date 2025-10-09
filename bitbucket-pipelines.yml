@@ -1,0 +1,141 @@
+image: php:8.2
+
+definitions:
+  caches:
+    composer: ~/.composer/cache
+    npm: ~/.npm
+  steps:
+    - step: &build-and-test
+        name: Build and Test
+        caches:
+          - composer
+          - npm
+        script:
+          # Install system dependencies
+          - apt-get update && apt-get install -y unzip git zip libpng-dev libzip-dev libonig-dev libicu-dev nodejs npm
+          # Install PHP extensions required for Laravel
+          - docker-php-ext-install pdo pdo_mysql gd zip pcntl posix exif bcmath opcache intl
+
+          # Install composer dependencies
+          - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          - export COMPOSER_ALLOW_SUPERUSER=1
+          - composer install --no-interaction --no-progress --prefer-dist
+
+          # Install and build frontend assets (if any)
+          - npm install
+          - npm run build
+
+          # Setup Laravel environment
+          - cp .env.example .env
+          - php artisan key:generate
+
+          # Run tests
+          - php artisan test
+        artifacts:
+          - public/build/**
+          - storage/logs/**
+
+    - step: &security-scan
+        name: Security Scan
+        caches:
+          - composer
+        script:
+          # PHP Security checks
+          - apt-get update && apt-get install -y git libpng-dev libzip-dev libonig-dev libicu-dev
+          # Install PHP extensions required for Laravel and Horizon
+          - docker-php-ext-install pdo pdo_mysql gd zip pcntl posix exif bcmath opcache intl
+
+          - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+          - export COMPOSER_ALLOW_SUPERUSER=1
+          # Use composer audit for security checks (built into Composer 2.4+)
+          - composer audit
+        pipes:
+          - pipe: atlassian/sonarcloud-scan:1.2.4
+            variables:
+              EXTRA_ARGS: "-Dsonar.sources=app,routes,config -Dsonar.projectKey=${BITBUCKET_REPO_SLUG}"
+
+    - step: &deploy
+        name: Deploy to Server
+        deployment: production
+        script:
+          # Install required packages
+          - apt-get update && apt-get install -y openssh-client zip unzip
+
+          # Setup SSH with improved debugging
+          - mkdir -p ~/.ssh
+          - echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          - chmod 600 ~/.ssh/id_ed25519
+          - ssh-keyscan -H $HOST >> ~/.ssh/known_hosts
+
+          # Debug SSH configuration
+          - echo "Testing SSH connection to $HOST..."
+          - ssh -o StrictHostKeyChecking=no -vvv $USER@$HOST "echo SSH connection successful"
+
+          # Pull latest code from the correct branch
+          - |
+            # Get the current branch being deployed
+            SOURCE_BRANCH=${BITBUCKET_BRANCH}
+            echo "Source branch: $SOURCE_BRANCH"
+
+            # Determine target branch based on environment
+            TARGET_BRANCH=""
+            if [ $ENVIRONMENT = "development" ]; then
+              TARGET_BRANCH="development"
+            elif [ $ENVIRONMENT = "production" ]; then
+              TARGET_BRANCH="main"
+            fi
+            echo "Target branch: $TARGET_BRANCH"
+
+          # Connect to server and deploy
+          - |
+            ssh -o StrictHostKeyChecking=no $USER@$HOST "cd $APP_PATH && \
+              git fetch --all && \
+              git checkout $TARGET_BRANCH && \
+              git pull origin $TARGET_BRANCH && \
+              git merge origin/$SOURCE_BRANCH -m 'Auto-merge from pipeline' && \
+              git push origin $TARGET_BRANCH && \
+              COMPOSER_ALLOW_SUPERUSER=1 composer install --no-interaction --no-dev --prefer-dist --optimize-autoloader && \
+              php artisan config:cache && \
+              php artisan route:cache && \
+              php artisan view:cache && \
+              php artisan migrate --force && \
+              php artisan storage:link || true && \
+              # Build frontend assets if needed
+              npm install && \
+              npm run build && \
+              # Restart services
+              sudo systemctl restart php-fpm || echo 'Could not restart PHP-FPM' && \
+              sudo systemctl restart nginx || echo 'Could not restart Nginx' && \
+              php artisan horizon:terminate || echo 'Horizon not running' && \
+              sudo supervisorctl restart laravel-horizon:* || echo 'Could not restart Horizon'"
+
+pipelines:
+  default:
+    - step: *build-and-test
+
+  branches:
+    "rc/*":
+      - step: *build-and-test
+      - step: *security-scan
+
+  custom:
+    deploy-to-development:
+      - step: *build-and-test
+      - step: *security-scan
+      - step:
+          <<: *deploy
+          deployment: development
+          name: Deploy to Development
+
+    deploy-to-production:
+      - step: *build-and-test
+      - step: *security-scan
+      - step:
+          <<: *deploy
+          deployment: production
+          name: Deploy to Production
+          # Variables that must be defined in the repository settings:
+          # SSH_PRIVATE_KEY: The SSH private key for connecting to the server
+          # HOST: The hostname or IP address of the server
+          # USER: The SSH user to connect with
+          # APP_PATH: The path to the application on the server

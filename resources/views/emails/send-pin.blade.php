@@ -1,0 +1,1 @@
+Your PIN is: {{ $pin }}
